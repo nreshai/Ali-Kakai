@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    min-height: 100dvh;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-overflow-scrolling: touch;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    background-color: #03060a;
+    font-family: 'JetBrains Mono', 'Share Tech Mono', monospace;
+    color: #34d399;
+  }
+  
+  #root {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    min-height: 100dvh;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  button, input, select, textarea, [role="button"] {
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* CRT Scanline & Phosphor Overlay */
+.crt-overlay {
+  background: linear-gradient(
+    rgba(18, 16, 16, 0) 50%, 
+    rgba(0, 0, 0, 0.25) 50%
+  ), linear-gradient(
+    90deg,
+    rgba(255, 0, 0, 0.03),
+    rgba(0, 255, 0, 0.01),
+    rgba(0, 0, 255, 0.03)
+  );
+  background-size: 100% 2px, 3px 100%;
+  pointer-events: none !important;
+  user-select: none !important;
+}
+
+/* Subtle Vignette */
+.vignette {
+  background: radial-gradient(circle at 50% 50%, transparent 65%, rgba(0, 0, 0, 0.85) 100%);
+  pointer-events: none !important;
+  user-select: none !important;
+}
+
+/* Custom Tactical Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(3, 7, 18, 0.8);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(16, 185, 129, 0.25);
+  border-radius: 0px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(16, 185, 129, 0.6);
+}
+
+/* Blinking terminal cursor */
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+.animate-cursor {
+  animation: blink 0.9s infinite;
+}
+
+/* Glowing text effects */
+.glow-green {
+  text-shadow: 0 0 5px rgba(52, 211, 153, 0.5), 0 0 10px rgba(52, 211, 153, 0.2);
+}
+
+.glow-red {
+  text-shadow: 0 0 6px rgba(248, 113, 113, 0.6), 0 0 12px rgba(239, 68, 68, 0.3);
+}
+
+.glow-amber {
+  text-shadow: 0 0 5px rgba(251, 191, 36, 0.5);
+}
+
+.glow-cyan {
+  text-shadow: 0 0 5px rgba(56, 189, 248, 0.5);
+}
+
+/* Border corner brackets styling */
+.hud-corner {
+  position: relative;
+}
+.hud-corner::before,
+.hud-corner::after {
+  content: '';
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  pointer-events: none;
+}
+.hud-corner::before {
+  top: 0;
+  left: 0;
+  border-top: 1px solid rgba(52, 211, 153, 0.7);
+  border-left: 1px solid rgba(52, 211, 153, 0.7);
+}
+.hud-corner::after {
+  bottom: 0;
+  right: 0;
+  border-bottom: 1px solid rgba(52, 211, 153, 0.7);
+  border-right: 1px solid rgba(52, 211, 153, 0.7);
+}

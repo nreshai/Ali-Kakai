@@ -1,0 +1,7 @@
+{
+  "name": "SpecterOS v7.4",
+  "description": "SpecterOS v7.4 - Secure Offensive Operations Console",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

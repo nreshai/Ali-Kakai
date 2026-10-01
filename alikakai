@@ -1,0 +1,531 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# SpecterOS v7.4 - Enterprise-Grade Termux Automated Runner & Orchestrator
+# Maintainer: Senior DevOps & Termux Platform Engineer
+# File: alikakai
+# ==============================================================================
+
+set -o pipefail
+
+# ANSI Color Palette
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+PURPLE='\033[0;35m'
+BLUE='\033[0;34m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+MIN_NODE_VERSION=18
+
+# Resolve Project Root Directory
+locate_project_dir() {
+  # 1. Check current directory
+  if [ -f "./package.json" ] && [ -f "./vite.config.ts" ]; then
+    pwd
+    return
+  fi
+
+  # 2. Check script directory
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -f "${script_dir}/package.json" ]; then
+    echo "$script_dir"
+    return
+  fi
+
+  # 3. Check ~/.specteros_dir pointer
+  if [ -f "${HOME}/.specteros_dir" ]; then
+    local saved_dir
+    saved_dir="$(cat "${HOME}/.specteros_dir" 2>/dev/null)"
+    if [ -n "$saved_dir" ] && [ -f "${saved_dir}/package.json" ]; then
+      echo "$saved_dir"
+      return
+    fi
+  fi
+
+  # 4. Standard Termux home locations
+  for candidate in "${HOME}/specteros" "${HOME}/SpecterOS" "${HOME}/specteros-v7.4" "${HOME}/applet"; do
+    if [ -f "${candidate}/package.json" ]; then
+      echo "$candidate"
+      return
+    fi
+  done
+
+  pwd
+}
+
+PROJECT_DIR="$(locate_project_dir)"
+cd "$PROJECT_DIR" || {
+  echo -e "${RED}[!] Error: Unable to access project directory: ${PROJECT_DIR}${NC}"
+  exit 1
+}
+
+# Ensure directories exist
+mkdir -p logs .cache
+
+LOG_FILE="${PROJECT_DIR}/logs/runtime.log"
+PID_FILE="${PROJECT_DIR}/logs/server.pid"
+CACHE_HASH_FILE="${PROJECT_DIR}/.cache/package.hash"
+
+log_msg() {
+  local level="$1"
+  local msg="$2"
+  local timestamp
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
+}
+
+# 1. OS & Environment Detection
+detect_os() {
+  if [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ] || [ -n "$PREFIX" ]; then
+    OS_TYPE="termux"
+  elif grep -qi "microsoft" /proc/version 2>/dev/null; then
+    OS_TYPE="wsl"
+  elif [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    OS_TYPE="macos"
+  elif [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+    OS_TYPE="linux"
+  else
+    OS_TYPE="unix"
+  fi
+}
+
+detect_os
+
+# 2. Storage Location Validation for Android/Termux
+# Android's emulated shared storage (/storage/emulated/0 or /sdcard) does NOT support POSIX symlinks!
+validate_storage_location() {
+  local target_dir="$1"
+  case "$target_dir" in
+    /storage/emulated/*|/sdcard|/sdcard/*)
+      echo -e "${RED}[!] FATAL: Project is located in Android shared storage: ${target_dir}${NC}"
+      echo -e "${YELLOW}[!] Android's emulated shared filesystem (/storage/emulated/0) does NOT support POSIX symlinks.${NC}"
+      echo -e "${YELLOW}[!] Installing node_modules here will fail with 'EACCES: permission denied, symlink'.${NC}"
+      echo -e "${CYAN}[*] Solution: Move the project to Termux internal private storage (~ / \$HOME):${NC}"
+      echo -e "    1. mkdir -p ~/projects"
+      echo -e "    2. cp -r \"${target_dir}\" ~/projects/"
+      echo -e "    3. cd ~/projects/$(basename "${target_dir}")"
+      echo -e "    4. alikakai"
+      log_msg "FATAL" "Refused to run in Android shared storage ($target_dir) due to missing symlink support"
+      exit 1
+      ;;
+  esac
+}
+
+# 3. Network IP Detection (POSIX compliant - ZERO grep -P)
+get_lan_ip() {
+  local ip=""
+
+  # Method A: ip route get (highest accuracy for default outbound gateway)
+  if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n 1)"
+  fi
+
+  # Method B: ip -4 addr show scope global
+  if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 addr show 2>/dev/null | awk '/inet / && !/127\.0\.0\.1/ {split($2, a, "/"); print a[1]}' | head -n 1)"
+  fi
+
+  # Method C: Android getprop (Specific to Android Termux)
+  if [ -z "$ip" ] && command -v getprop >/dev/null 2>&1; then
+    ip="$(getprop dhcp.wlan0.ipaddress 2>/dev/null)"
+    [ -z "$ip" ] && ip="$(getprop net.wlan0.ip 2>/dev/null)"
+  fi
+
+  # Method D: ifconfig POSIX-compliant parsing
+  if [ -z "$ip" ] && command -v ifconfig >/dev/null 2>&1; then
+    ip="$(ifconfig 2>/dev/null | awk '/inet / && !/127\.0\.0\.1/ {for(i=1;i<=NF;i++) if($i=="inet" || $i=="addr:") {val=$(i+1); sub(/^addr:/,"",val); print val; exit}}')"
+  fi
+
+  # Method E: hostname -I
+  if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+
+  echo "$ip"
+}
+
+# 4. Smart Port Availability Scanner
+is_port_in_use() {
+  local port="$1"
+  # Method 1: /dev/tcp built-in
+  (echo >"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1 && return 0
+  
+  # Method 2: ss if available
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlpn 2>/dev/null | grep -E ":$port\b" >/dev/null 2>&1 && return 0
+  fi
+
+  # Method 3: netstat if available
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -tuln 2>/dev/null | grep -E ":$port\b" >/dev/null 2>&1 && return 0
+  fi
+
+  return 1
+}
+
+find_available_port() {
+  local port="${PORT:-3000}"
+  local max_port=$((port + 25))
+
+  while [ "$port" -le "$max_port" ]; do
+    if ! is_port_in_use "$port"; then
+      echo "$port"
+      return 0
+    fi
+    port=$((port + 1))
+  done
+
+  echo "${PORT:-3000}"
+}
+
+# 5. Combined Package Hashing for Cache Optimization (package.json + package-lock.json)
+calculate_package_hash() {
+  local files=()
+  [ -f "package.json" ] && files+=("package.json")
+  [ -f "package-lock.json" ] && files+=("package-lock.json")
+
+  if [ ${#files[@]} -eq 0 ]; then
+    echo "nohash"
+    return
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${files[@]}" 2>/dev/null | sha256sum 2>/dev/null | awk '{print $1}'
+  elif command -v md5sum >/dev/null 2>&1; then
+    md5sum "${files[@]}" 2>/dev/null | md5sum 2>/dev/null | awk '{print $1}'
+  elif command -v cksum >/dev/null 2>&1; then
+    cksum "${files[@]}" 2>/dev/null | cksum 2>/dev/null | awk '{print $1}'
+  else
+    wc -c "${files[@]}" 2>/dev/null | awk '{sum+=$1} END {print sum}'
+  fi
+}
+
+# 6. Dependency Audit & Auto-Install
+check_and_install_prereqs() {
+  local missing=()
+
+  command -v node >/dev/null 2>&1 || missing+=("nodejs-lts")
+  command -v npm >/dev/null 2>&1 || missing+=("nodejs-lts")
+  command -v git >/dev/null 2>&1 || missing+=("git")
+  command -v curl >/dev/null 2>&1 || missing+=("curl")
+  command -v unzip >/dev/null 2>&1 || missing+=("unzip")
+
+  # Deduplicate array
+  local unique_missing=()
+  for item in "${missing[@]}"; do
+    local found=0
+    for u in "${unique_missing[@]}"; do
+      [ "$u" = "$item" ] && found=1 && break
+    done
+    [ $found -eq 0 ] && unique_missing+=("$item")
+  done
+
+  if [ ${#unique_missing[@]} -gt 0 ]; then
+    echo -e "${YELLOW}[!] Missing prerequisite packages: ${unique_missing[*]}${NC}"
+    if [ "$OS_TYPE" = "termux" ]; then
+      echo -e "${PURPLE}[+] Auto-installing missing packages via Termux pkg...${NC}"
+      pkg update -y && pkg install -y "${unique_missing[@]}"
+      if [ $? -ne 0 ]; then
+        echo -e "${RED}[!] Package installation failed. Please check network connection.${NC}"
+        log_msg "ERROR" "Failed to install prerequisites: ${unique_missing[*]}"
+        exit 1
+      fi
+    else
+      echo -e "${RED}[!] Please install missing packages manually: ${unique_missing[*]}${NC}"
+      exit 1
+    fi
+  fi
+
+  # Validate Node.js Version
+  local node_ver
+  node_ver="$(node -v 2>/dev/null | sed -E 's/^v//')"
+  local node_major
+  node_major="$(echo "$node_ver" | cut -d'.' -f1)"
+
+  if [ -n "$node_major" ] && [ "$node_major" -lt "$MIN_NODE_VERSION" ]; then
+    echo -e "${RED}[!] Node.js version v${node_ver} detected. Project requires >= v${MIN_NODE_VERSION}.${NC}"
+    if [ "$OS_TYPE" = "termux" ]; then
+      echo -e "${PURPLE}[+] Upgrading Node.js to LTS in Termux...${NC}"
+      pkg update -y && pkg install -y nodejs-lts
+    else
+      echo -e "${YELLOW}[*] Please upgrade Node.js to version 18 or higher.${NC}"
+      exit 1
+    fi
+  fi
+}
+
+# 7. Clean Node Modules Resolver (Standard npm install - ZERO --force)
+ensure_node_dependencies() {
+  local force="$1"
+  validate_storage_location "$PROJECT_DIR"
+
+  local current_hash
+  current_hash="$(calculate_package_hash)"
+
+  local cached_hash=""
+  [ -f "$CACHE_HASH_FILE" ] && cached_hash="$(cat "$CACHE_HASH_FILE" 2>/dev/null)"
+
+  local modules_healthy=true
+  if [ ! -d "node_modules" ] || [ ! -f "node_modules/.bin/vite" ] || [ ! -d "node_modules/vite" ] || [ ! -d "node_modules/esbuild" ]; then
+    modules_healthy=false
+  fi
+
+  if [ "$force" = "true" ] || [ "$modules_healthy" = "false" ] || [ "$current_hash" != "$cached_hash" ]; then
+    echo -e "${YELLOW}[*] Resolving project dependencies (clean npm install)...${NC}"
+    log_msg "INFO" "Installing npm dependencies (Hash mismatch or uninitialized modules)"
+
+    # Run clean standard npm install - NO --force, NO --legacy-peer-deps
+    npm install --no-audit --no-fund 2>&1 | tee -a "$LOG_FILE"
+    local status=${PIPESTATUS[0]}
+
+    if [ $status -ne 0 ]; then
+      echo -e "${RED}[!] FATAL: 'npm install' failed with exit code $status.${NC}"
+      echo -e "${RED}[!] Dependency resolution failed. Aborting execution without fallback to avoid corrupted states.${NC}"
+      echo -e "${YELLOW}[*] Check logs in: ${LOG_FILE}${NC}"
+      log_msg "FATAL" "npm install failed with exit code $status"
+      rm -f "$CACHE_HASH_FILE"
+      exit "$status"
+    fi
+
+    # Re-verify critical binaries exist
+    if [ ! -d "node_modules" ] || [ ! -f "node_modules/.bin/vite" ] || [ ! -d "node_modules/esbuild" ]; then
+      echo -e "${RED}[!] FATAL: Incomplete node_modules detected after install (missing core binaries).${NC}"
+      log_msg "FATAL" "Incomplete node_modules detected after install"
+      rm -f "$CACHE_HASH_FILE"
+      exit 1
+    fi
+
+    # Recalculate hash (in case package-lock.json was updated) and cache it
+    current_hash="$(calculate_package_hash)"
+    echo "$current_hash" > "$CACHE_HASH_FILE"
+    echo -e "${GREEN}[✔] Clean dependencies verified and lockfile synchronized.${NC}"
+    log_msg "SUCCESS" "Dependencies installed and cached cleanly with hash: $current_hash"
+  else
+    echo -e "${GREEN}[✔] Dependencies verified from cache. Skipping install.${NC}"
+    log_msg "INFO" "Using cached node_modules (hash matches: $current_hash)"
+  fi
+}
+
+# 8. Process Lifecycle & Stop Routine
+stop_existing_server() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo -e "${YELLOW}[*] Stopping existing SpecterOS process (PID: $pid)...${NC}"
+      kill -15 "$pid" 2>/dev/null || true
+      sleep 1.5
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+      echo -e "${GREEN}[✔] Stopped successfully.${NC}"
+    fi
+    rm -f "$PID_FILE"
+  fi
+}
+
+# ==============================================================================
+# CLI Argument Router
+# ==============================================================================
+case "$1" in
+  --stop)
+    stop_existing_server
+    exit 0
+    ;;
+  --status)
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+      echo -e "${GREEN}SpecterOS server is currently RUNNING (PID: $(cat "$PID_FILE")).${NC}"
+    else
+      echo -e "${YELLOW}SpecterOS server is STOPPED.${NC}"
+    fi
+    exit 0
+    ;;
+  --ip)
+    echo -e "${CYAN}Detected Network IP Addresses:${NC}"
+    echo "  -> Localhost: 127.0.0.1"
+    lan="$(get_lan_ip)"
+    [ -n "$lan" ] && echo "  -> Network:   $lan"
+    exit 0
+    ;;
+  --info)
+    detect_os
+    echo -e "${CYAN}${BOLD}=== SpecterOS Environment Telemetry ===${NC}"
+    echo "  OS Type:      $OS_TYPE"
+    echo "  Project Dir:  $PROJECT_DIR"
+    echo "  Architecture: $(uname -m 2>/dev/null || echo 'Unknown')"
+    echo "  Node Version: $(node -v 2>/dev/null || echo 'Not installed')"
+    echo "  NPM Version:  $(npm -v 2>/dev/null || echo 'Not installed')"
+    echo "  LAN IP:       $(get_lan_ip)"
+    echo "  Active PID:   $([ -f "$PID_FILE" ] && cat "$PID_FILE" || echo 'None')"
+    exit 0
+    ;;
+  --clean)
+    echo -e "${YELLOW}[*] Purging build artifacts, cache, and logs...${NC}"
+    rm -rf .cache dist logs/*.log
+    echo -e "${GREEN}[✔] Clean completed.${NC}"
+    exit 0
+    ;;
+  --reinstall)
+    echo -e "${YELLOW}[*] Performing complete dependency re-installation...${NC}"
+    stop_existing_server
+    rm -rf node_modules package-lock.json .cache
+    check_and_install_prereqs
+    ensure_node_dependencies "true"
+    exit 0
+    ;;
+  --build)
+    check_and_install_prereqs
+    ensure_node_dependencies "false"
+    echo -e "${CYAN}[*] Building production bundle...${NC}"
+    npm run build
+    exit $?
+    ;;
+  --prod)
+    check_and_install_prereqs
+    ensure_node_dependencies "false"
+    if [ ! -d "dist" ]; then
+      echo -e "${YELLOW}[*] 'dist' not found. Building first...${NC}"
+      npm run build
+    fi
+    PORT="$(find_available_port)"
+    echo -e "${GREEN}[✔] Starting production preview on 0.0.0.0:${PORT}...${NC}"
+    exec npm run preview -- --host 0.0.0.0 --port "$PORT"
+    ;;
+  --help|-h)
+    echo -e "${BOLD}Usage: alikakai [OPTION]${NC}"
+    echo "  (no args)    Automatically initialize, verify, and run SpecterOS"
+    echo "  --debug      Run in verbose debug mode with detailed log tracing"
+    echo "  --stop       Gracefully terminate any running background server"
+    echo "  --status     Check if the server is active and inspect its PID"
+    echo "  --ip         List detected local and network LAN IPv4 addresses"
+    echo "  --info       Display system architecture, Node, and Termux telemetry"
+    echo "  --clean      Remove cache, dist build outputs, and temporary logs"
+    echo "  --reinstall  Wipe node_modules and perform clean dependency installation"
+    echo "  --build      Compile optimized production build artifacts"
+    echo "  --prod       Launch production preview server"
+    echo "  --help       Show this help documentation"
+    exit 0
+    ;;
+esac
+
+DEBUG_MODE=false
+if [ "$1" = "--debug" ]; then
+  DEBUG_MODE=true
+  echo -e "${YELLOW}[DEBUG MODE ACTIVE]${NC}"
+fi
+
+# ==============================================================================
+# Main Interactive Launch Flow
+# ==============================================================================
+clear
+echo -e "${GREEN}${BOLD}"
+echo "  ███████╗██████╗ ███████╗ ██████╗████████╗███████╗██████╗ "
+echo "  ██╔════╝██╔══██╗██╔════╝██╔════╝╚══██╔══╝██╔════╝██╔══██╗"
+echo "  ███████╗██████╔╝█████╗  ██║        ██║   █████╗  ██████╔╝"
+echo "  ╚════██║██╔═══╝ ██╔══╝  ██║        ██║   ██╔══╝  ██╔══██╗"
+echo "  ███████║██║     ███████╗╚██████╗   ██║   ███████╗██║  ██║"
+echo "  ╚══════╝╚═╝     ╚══════╝ ╚═════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝"
+echo "        SpecterOS v7.4 - Hardened Cyber Operations Core   "
+echo -e "${NC}"
+echo -e "${CYAN}[*] Target Enclave:${NC} ${PROJECT_DIR}"
+echo -e "${CYAN}[*] Platform Detection:${NC} ${OS_TYPE^^}"
+echo "--------------------------------------------------------"
+
+# 1. Stop any dangling servers before starting fresh
+stop_existing_server
+
+# 2. Prerequisites Check
+echo -e "${YELLOW}[1/4] Auditing Termux runtime environment...${NC}"
+check_and_install_prereqs
+
+# 3. Synchronize Dependencies with Clean Standard npm install
+echo -e "${YELLOW}[2/4] Verifying clean node dependency integrity...${NC}"
+ensure_node_dependencies "false"
+
+# 4. Port Negotiation
+echo -e "${YELLOW}[3/4] Negotiating listening port binding...${NC}"
+SELECTED_PORT="$(find_available_port)"
+
+if [ "$SELECTED_PORT" != "3000" ]; then
+  echo -e "${YELLOW}[i] Port 3000 occupied by another service. Automatically switched to port ${SELECTED_PORT}.${NC}"
+  log_msg "INFO" "Port 3000 in use. Bound to port $SELECTED_PORT"
+fi
+
+LAN_IP="$(get_lan_ip)"
+
+echo -e "${GREEN}[✔] Operational Gateway Bound to: http://0.0.0.0:${SELECTED_PORT}${NC}"
+echo "--------------------------------------------------------"
+echo -e "${BOLD}${GREEN}SpecterOS Console Access Points:${NC}"
+echo -e "  👉 Local Loopback:   ${CYAN}http://localhost:${SELECTED_PORT}${NC}"
+echo -e "  👉 Internal IP:      ${CYAN}http://127.0.0.1:${SELECTED_PORT}${NC}"
+if [ -n "$LAN_IP" ]; then
+  echo -e "  👉 Mobile/Wi-Fi LAN: ${CYAN}http://${LAN_IP}:${SELECTED_PORT}${NC}"
+fi
+echo "--------------------------------------------------------"
+echo -e "${GRAY}[i] Press Ctrl+C in Termux to safely terminate.${NC}"
+echo "--------------------------------------------------------"
+
+# 5. Launch Browser if Termux API / Android Intent is Available
+if command -v termux-open-url >/dev/null 2>&1; then
+  (sleep 2 && termux-open-url "http://localhost:${SELECTED_PORT}") >/dev/null 2>&1 &
+elif command -v termux-open >/dev/null 2>&1; then
+  (sleep 2 && termux-open "http://localhost:${SELECTED_PORT}") >/dev/null 2>&1 &
+elif [ "$OS_TYPE" = "macos" ] && command -v open >/dev/null 2>&1; then
+  (sleep 2 && open "http://localhost:${SELECTED_PORT}") >/dev/null 2>&1 &
+elif command -v xdg-open >/dev/null 2>&1; then
+  (sleep 2 && xdg-open "http://localhost:${SELECTED_PORT}") >/dev/null 2>&1 &
+fi
+
+# 6. Execute Vite Server with Process Monitoring
+echo -e "${GREEN}[4/4] Starting Vite Operations Engine...${NC}"
+log_msg "INFO" "Starting Vite on port $SELECTED_PORT (Debug: $DEBUG_MODE)"
+
+export PORT="$SELECTED_PORT"
+
+# Clean exit handler
+cleanup() {
+  echo ""
+  echo -e "${YELLOW}[*] Shutting down SpecterOS engine gracefully...${NC}"
+  stop_existing_server
+  log_msg "INFO" "SpecterOS server stopped by user signal"
+  exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+MAX_RETRIES=2
+ATTEMPT=1
+
+while [ $ATTEMPT -le $MAX_RETRIES ]; do
+  if [ "$DEBUG_MODE" = "true" ]; then
+    npm run dev -- --host 0.0.0.0 --port "$SELECTED_PORT" 2>&1 | tee -a "$LOG_FILE" &
+  else
+    npm run dev -- --host 0.0.0.0 --port "$SELECTED_PORT" >> "$LOG_FILE" 2>&1 &
+  fi
+  SERVER_PID=$!
+  echo "$SERVER_PID" > "$PID_FILE"
+
+  # Wait 2.5 seconds to monitor initial boot health
+  sleep 2.5
+
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    # Server is healthy and running in foreground wait
+    wait "$SERVER_PID"
+    break
+  else
+    echo -e "${RED}[!] Server exited unexpectedly on attempt $ATTEMPT of $MAX_RETRIES. Checking logs...${NC}"
+    log_msg "WARN" "Server process $SERVER_PID crashed on attempt $ATTEMPT"
+    tail -n 12 "$LOG_FILE" 2>/dev/null
+    ATTEMPT=$((ATTEMPT + 1))
+    if [ $ATTEMPT -le $MAX_RETRIES ]; then
+      echo -e "${YELLOW}[*] Retrying after cache purge...${NC}"
+      rm -rf .cache node_modules/.vite 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+done
+
+cleanup
